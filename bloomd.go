@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"gopkg.in/fatih/pool.v2"
 	"io"
 	"net"
 	"strings"
-	"time"
 )
 
 type Filter string
@@ -28,6 +28,26 @@ type Client interface {
 	Set(context.Context, Filter, string) (bool, error)
 	Info(context.Context, Filter) (map[string]string, error)
 	Ping() error
+}
+
+type Connection interface {
+	Check(context.Context, Filter, string) (bool, error)
+	Clear(context.Context, Filter) error
+	Close(context.Context, Filter) error
+	Create(context.Context, Filter) error
+	Drop(context.Context, Filter) error
+	Flush(context.Context) error
+	List(context.Context) (map[string]string, error)
+	MultiCheck(context.Context, Filter, ...string) ([]bool, error)
+	MultiSet(context.Context, Filter, ...string) ([]bool, error)
+	Set(context.Context, Filter, string) (bool, error)
+	Info(context.Context, Filter) (map[string]string, error)
+}
+
+type Pool interface {
+	Get() (Connection, error)
+	Close()
+	Len() int
 }
 
 const (
@@ -53,57 +73,48 @@ const (
 	RESPONSE_END    = "END"
 )
 
-type client struct {
-	hostname    string
-	timeout     time.Duration
-	addr        *net.TCPAddr
-	maxAttempts int
-	hashKeys    bool
+type connection struct {
+	net.TCPConn
+	hashKeys bool
 }
 
-func NewClient(hostname string, hashKeys bool, timeout time.Duration) (Client, error) {
-	// TODO probably need to have a go routine call addr to resolve DNS periodically
-	addr, err := net.ResolveTCPAddr("tcp", hostname)
-	if err != nil {
-		return nil, err
+// Returns the key we should send to the server
+func (t connection) hashKey(key string) string {
+	if t.hashKeys {
+		h := sha1.New()
+		s := h.Sum([]byte(key))
+		return fmt.Sprintf("%x", s)
 	}
-
-	return &client{
-		hostname:    hostname,
-		timeout:     timeout,
-		addr:        addr,
-		hashKeys:    hashKeys,
-		maxAttempts: 3,
-	}, nil
+	return key
 }
 
 // Add multi keys to the filter
-func (t client) MultiSet(ctx context.Context, name Filter, keys ...string) ([]bool, error) {
+func (t connection) MultiSet(ctx context.Context, name Filter, keys ...string) ([]bool, error) {
 	return t.sendMultiCommand(BULK, name, keys...)
 }
 
 // Check if key exists in filter
-func (t client) Check(ctx context.Context, name Filter, key string) (bool, error) {
+func (t connection) Check(ctx context.Context, name Filter, key string) (bool, error) {
 	return false, errors.New("not implemented")
 }
 
 // Clears the filter
-func (t client) Clear(ctx context.Context, name Filter) error {
+func (t connection) Clear(ctx context.Context, name Filter) error {
 	return t.sendCommandDone(fmt.Sprintf(CLEAR, name))
 }
 
 // Closes the filter
-func (t client) Close(ctx context.Context, name Filter) error {
+func (t connection) Close(ctx context.Context, name Filter) error {
 	return t.sendCommandDone(fmt.Sprintf(CLOSE, name))
 }
 
 // Creates new fiter
-func (t client) Create(ctx context.Context, name Filter) error {
+func (t connection) Create(ctx context.Context, name Filter) error {
 	return t.CreateWithParams(ctx, name, 0, 0, false)
 }
 
 // Creates new fiter with additional params
-func (t client) CreateWithParams(ctx context.Context, name Filter, capacity int, probability float64, inMemory bool) error {
+func (t connection) CreateWithParams(ctx context.Context, name Filter, capacity int, probability float64, inMemory bool) error {
 	if probability > 0 && capacity < 1 {
 		return errors.New("invalid capacity/probability")
 	}
@@ -137,31 +148,31 @@ func (t client) CreateWithParams(ctx context.Context, name Filter, capacity int,
 }
 
 // Permanently deletes filter
-func (t client) Drop(ctx context.Context, name Filter) error {
+func (t connection) Drop(ctx context.Context, name Filter) error {
 	return t.sendCommandDone(fmt.Sprintf(DROP, name))
 }
 
 // Flush to disk
-func (t client) Flush(ctx context.Context) error {
+func (t connection) Flush(ctx context.Context) error {
 	return t.sendCommandDone(FLUSH)
 }
 
-func (t client) Info(ctx context.Context, name Filter) (map[string]string, error) {
+func (t connection) Info(ctx context.Context, name Filter) (map[string]string, error) {
 	return t.sendBlockCommand(fmt.Sprintf(INFO, name))
 }
 
 // List filters
-func (t client) List(ctx context.Context) (map[string]string, error) {
+func (t connection) List(ctx context.Context) (map[string]string, error) {
 	return t.sendBlockCommand(LIST)
 }
 
 // Checks whether multiple keys exist in the filter
-func (t client) MultiCheck(ctx context.Context, name Filter, keys ...string) ([]bool, error) {
+func (t connection) MultiCheck(ctx context.Context, name Filter, keys ...string) ([]bool, error) {
 	return t.sendMultiCommand(MULTI, name, keys...)
 }
 
 // Add new key to filter
-func (t client) Set(ctx context.Context, name Filter, key string) (bool, error) {
+func (t connection) Set(ctx context.Context, name Filter, key string) (bool, error) {
 	cmd := fmt.Sprintf(SET, name, t.hashKey(key))
 	resp, err := t.sendCommand(cmd)
 	if err != nil {
@@ -178,23 +189,7 @@ func (t client) Set(ctx context.Context, name Filter, key string) (bool, error) 
 	}
 }
 
-func (t client) Ping() error {
-	ctx := context.Background()
-	_, err := t.List(ctx)
-	return err
-}
-
-// Returns the key we should send to the server
-func (t client) hashKey(key string) string {
-	if t.hashKeys {
-		h := sha1.New()
-		s := h.Sum([]byte(key))
-		return fmt.Sprintf("%x", s)
-	}
-	return key
-}
-
-func (t client) sendCommandDone(cmd string) error {
+func (t connection) sendCommandDone(cmd string) error {
 	resp, err := t.sendCommand(cmd)
 	if err != nil {
 		return errors.Wrapf(err, "bloomd: error with command '%s'", cmd)
@@ -207,7 +202,7 @@ func (t client) sendCommandDone(cmd string) error {
 	return nil
 }
 
-func (t client) sendMultiCommand(c string, name Filter, keys ...string) ([]bool, error) {
+func (t connection) sendMultiCommand(c string, name Filter, keys ...string) ([]bool, error) {
 	cmd := t.multiCommand(c, name, keys...)
 
 	resp, err := t.sendCommand(cmd)
@@ -228,7 +223,7 @@ func (t client) sendMultiCommand(c string, name Filter, keys ...string) ([]bool,
 	return results, nil
 }
 
-func (t client) multiCommand(cmd string, name Filter, keys ...string) string {
+func (t connection) multiCommand(cmd string, name Filter, keys ...string) string {
 	buf := &bytes.Buffer{}
 	buf.WriteString(cmd)
 	buf.WriteRune(' ')
@@ -240,7 +235,7 @@ func (t client) multiCommand(cmd string, name Filter, keys ...string) string {
 	return buf.String()
 }
 
-func (t client) sendBlockCommand(cmd string) (map[string]string, error) {
+func (t connection) sendBlockCommand(cmd string) (map[string]string, error) {
 	resp, err := t.sendCommand(LIST)
 	if err != nil {
 		return nil, err
@@ -268,7 +263,7 @@ func (t client) sendBlockCommand(cmd string) (map[string]string, error) {
 	return responses, nil
 }
 
-func (t client) sendCommand(cmd string) (string, error) {
+func (t connection) sendCommand(cmd string) (string, error) {
 	conn, err := newConnection(t.addr, t.maxAttempts)
 	if err != nil {
 		return "", err
@@ -286,24 +281,6 @@ func (t client) sendCommand(cmd string) (string, error) {
 
 	return line, nil
 }
-
-func newConnection(addr *net.TCPAddr, maxAttempts int) (io.ReadWriteCloser, error) {
-	attempted := 0
-
-	var conn net.Conn
-	var err error
-	for attempted < maxAttempts {
-		conn, err = net.DialTCP("tcp", nil, addr)
-		if err == nil {
-			conn.SetReadDeadline(time.Now().Add(time.Second))
-			return conn, nil
-		}
-		attempted++
-	}
-
-	return nil, errors.Wrap(err, "bloomd: unable to establish a connection")
-}
-
 func send(w io.Writer, cmd string, maxAttempts int) error {
 	attempted := 0
 
@@ -345,4 +322,39 @@ func recv(r io.Reader) (string, error) {
 	}
 
 	return strings.TrimRight(buf.String(), "\r\n"), nil
+}
+
+type singlePool struct{}
+
+// Single connection "pool"
+func (t *singlePool) Get() (Connection, error) {
+	return net.Dial("tcp", hostname)
+}
+
+func (t *singlePool) Close() {
+}
+
+func (t *singlePool) Len() int {
+	return 1
+}
+
+// Connection Pool using fatih library
+type fatihPool struct {
+	p pool.Pool
+}
+
+func (t *fatihPool) Get() (Connection, error) {
+	conn, err := t.p.Get()
+	if err != nil {
+		return nil, err
+	}
+	return &connection{conn}, nil
+}
+
+func (t *fatihPool) Close() {
+	t.p.Close()
+}
+
+func (t *fatihPool) Len() int {
+	return t.p.Len()
 }
